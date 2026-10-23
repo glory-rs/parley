@@ -106,6 +106,7 @@ where
     buffer: String,
     default_style: StyleSet<T>,
     style_spans: Vec<EditorStyleSpan<T>>,
+    inline_boxes: Vec<crate::InlineBox>,
     selection: Selection,
     /// Byte offsets of IME composing preedit text in the text buffer.
     /// `None` if the IME is not currently composing.
@@ -140,6 +141,7 @@ where
         Self {
             default_style: StyleSet::new(font_size),
             style_spans: Vec::new(),
+            inline_boxes: Vec::new(),
             buffer: String::default(),
             layout: Layout::default(),
             selection: Selection::default(),
@@ -960,6 +962,7 @@ where
         self.buffer.clear();
         self.buffer.push_str(is);
         self.style_spans.clear();
+        self.inline_boxes.clear();
         let clamp = |cursor: Cursor| {
             let mut index = cursor.index.min(is.len());
             while !is.is_char_boundary(index) {
@@ -1064,6 +1067,38 @@ where
         &self.style_spans
     }
 
+    /// Replace atomic inline objects anchored to U+FFFC in the raw buffer.
+    /// Invalid boundaries, dimensions or duplicate identifiers leave state intact.
+    pub fn set_inline_boxes(
+        &mut self,
+        boxes: Vec<crate::InlineBox>,
+    ) -> Result<(), InvalidStyleRange> {
+        let mut ids = alloc::collections::BTreeSet::new();
+        if boxes.iter().any(|b| {
+            !ids.insert(b.id)
+                || !self.buffer.is_char_boundary(b.index)
+                || !self
+                    .buffer
+                    .get(b.index..)
+                    .is_some_and(|s| s.starts_with('\u{fffc}'))
+                || !b.width.is_finite()
+                || b.width < 0.0
+                || !b.height.is_finite()
+                || b.height < 0.0
+                || b.baseline.is_some_and(|v| !v.is_finite())
+        }) {
+            return Err(InvalidStyleRange);
+        }
+        self.inline_boxes = boxes;
+        self.layout_dirty = true;
+        Ok(())
+    }
+
+    /// Atomic objects in the current raw buffer, with offsets adjusted by editing.
+    pub fn inline_boxes(&self) -> &[crate::InlineBox] {
+        &self.inline_boxes
+    }
+
     // Every text edit, including preedit replacement/cancellation, passes here.
     // Insertions inherit the properties immediately to their left, except at
     // the start of the document where the first character's properties apply.
@@ -1096,6 +1131,15 @@ where
             }
             span.range = start..end;
             start < end
+        });
+        self.inline_boxes.retain_mut(|object| {
+            if object.index >= range.start && object.index < range.end {
+                return false;
+            }
+            if object.index >= range.end {
+                object.index = object.index - old_len + inserted;
+            }
+            true
         });
         self.buffer.replace_range(range, text);
     }
@@ -1270,6 +1314,15 @@ where
         for span in &self.style_spans {
             builder.push(span.property.clone(), span.range.clone());
         }
+        for object in &self.inline_boxes {
+            // The replacement character owns one selection unit but no glyph advance.
+            builder.push(StyleProperty::FontSize(0.0), object.index..object.index + 3);
+            let mut scaled = object.clone();
+            scaled.width *= self.scale;
+            scaled.height *= self.scale;
+            scaled.baseline = scaled.baseline.map(|v| v * self.scale);
+            builder.push_inline_box(scaled);
+        }
         if let Some(preedit_range) = &self.compose {
             builder.push(StyleProperty::Underline(true), preedit_range.clone());
         }
@@ -1355,5 +1408,46 @@ mod attributed_tests {
         let mut editor = styled();
         editor.set_text("x");
         assert!(editor.style_spans().is_empty());
+    }
+    #[test]
+    fn atomic_objects_follow_unicode_edits_and_reject_invalid_updates() {
+        let mut editor = PlainEditor::<()>::new(16.0);
+        editor.set_text("a\u{fffc}z");
+        let object = crate::InlineBox {
+            id: 7,
+            index: 1,
+            width: 40.0,
+            height: 20.0,
+            baseline: None,
+            kind: crate::InlineBoxKind::InFlow,
+            vertical_align: crate::VerticalAlign::BASELINE,
+        };
+        editor.set_inline_boxes(vec![object.clone()]).unwrap();
+        let mut invalid = object.clone();
+        invalid.width = f32::NAN;
+        assert!(editor.set_inline_boxes(vec![invalid]).is_err());
+        assert_eq!(editor.inline_boxes(), &[object]);
+        editor.replace_buffer_range(0..0, "中");
+        assert_eq!(editor.inline_boxes()[0].index, 4);
+        let mut fonts = FontContext::new();
+        let mut layouts = LayoutContext::new();
+        editor.set_scale(2.0);
+        editor.update_layout(&mut fonts, &mut layouts);
+        let positions: Vec<_> = editor
+            .layout
+            .lines()
+            .flat_map(|l| l.items())
+            .filter_map(|i| {
+                if let crate::PositionedLayoutItem::InlineBox(b) = i {
+                    Some((b.width, b.height))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(positions, vec![(80.0, 40.0)]);
+        editor.replace_buffer_range(4..7, "");
+        assert!(editor.inline_boxes().is_empty());
+        assert_eq!(editor.raw_text(), "中az");
     }
 }
