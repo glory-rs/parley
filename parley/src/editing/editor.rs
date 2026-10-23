@@ -78,7 +78,21 @@ impl<'source> IntoIterator for SplitString<'source> {
     }
 }
 
-/// Basic plain text editor with a single style applied to the entire text.
+/// An owned property applied to a UTF-8 byte range in an editor buffer.
+///
+/// Properties are applied in slice order after the default style. Ranges must
+/// have character-boundary endpoints; an empty range does not affect layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorStyleSpan<T: Brush> {
+    pub range: Range<usize>,
+    pub property: StyleProperty<'static, T>,
+}
+
+/// Invalid UTF-8 byte range supplied to an editor style update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidStyleRange;
+
+/// Text editor with a default style and optional attributed ranges.
 ///
 /// Internally, this is a wrapper around a string buffer and its corresponding [`Layout`],
 /// which is kept up-to-date as needed.
@@ -91,6 +105,7 @@ where
     layout: Layout<T>,
     buffer: String,
     default_style: StyleSet<T>,
+    style_spans: Vec<EditorStyleSpan<T>>,
     selection: Selection,
     /// Byte offsets of IME composing preedit text in the text buffer.
     /// `None` if the IME is not currently composing.
@@ -124,6 +139,7 @@ where
     pub fn new(font_size: f32) -> Self {
         Self {
             default_style: StyleSet::new(font_size),
+            style_spans: Vec::new(),
             buffer: String::default(),
             layout: Layout::default(),
             selection: Selection::default(),
@@ -186,7 +202,7 @@ where
         if range.is_empty() || !self.editor.buffer.is_char_boundary(range.start) {
             return;
         }
-        self.editor.buffer.replace_range(range.clone(), "");
+        self.editor.replace_buffer_range(range.clone(), "");
         self.editor
             .update_compose_for_replaced_range(range.clone(), 0);
         self.update_layout();
@@ -228,7 +244,7 @@ where
         if range.is_empty() || !self.editor.buffer.is_char_boundary(range.end) {
             return;
         }
-        self.editor.buffer.replace_range(range.clone(), "");
+        self.editor.replace_buffer_range(range.clone(), "");
         self.editor.update_compose_for_replaced_range(range, 0);
         self.update_layout();
     }
@@ -246,7 +262,7 @@ where
                 .map(|cluster| cluster.text_range())
                 .and_then(|range| (!range.is_empty()).then_some(range))
             {
-                self.editor.buffer.replace_range(range.clone(), "");
+                self.editor.replace_buffer_range(range.clone(), "");
                 self.editor.update_compose_for_replaced_range(range, 0);
                 self.update_layout();
             }
@@ -262,7 +278,7 @@ where
             let start = focus.index();
             let end = focus.next_logical_word(&self.editor.layout).index();
             if self.editor.buffer.get(start..end).is_some() {
-                self.editor.buffer.replace_range(start..end, "");
+                self.editor.replace_buffer_range(start..end, "");
                 self.editor.update_compose_for_replaced_range(start..end, 0);
                 self.update_layout();
                 self.editor.set_selection(
@@ -302,7 +318,7 @@ where
                     };
                     start
                 };
-                self.editor.buffer.replace_range(start..end, "");
+                self.editor.replace_buffer_range(start..end, "");
                 self.editor.update_compose_for_replaced_range(start..end, 0);
                 self.update_layout();
                 self.editor.set_selection(
@@ -322,7 +338,7 @@ where
             let end = focus.index();
             let start = focus.previous_logical_word(&self.editor.layout).index();
             if self.editor.buffer.get(start..end).is_some() {
-                self.editor.buffer.replace_range(start..end, "");
+                self.editor.replace_buffer_range(start..end, "");
                 self.editor.update_compose_for_replaced_range(start..end, 0);
                 self.update_layout();
                 self.editor.set_selection(
@@ -352,23 +368,13 @@ where
         debug_assert!(!text.is_empty());
         debug_assert!(cursor.map(|cursor| cursor.1 <= text.len()).unwrap_or(true));
 
-        let start = if let Some(preedit_range) = &self.editor.compose {
-            self.editor
-                .buffer
-                .replace_range(preedit_range.clone(), text);
-            preedit_range.start
-        } else {
-            if self.editor.selection.is_collapsed() {
-                self.editor
-                    .buffer
-                    .insert_str(self.editor.selection.text_range().start, text);
-            } else {
-                self.editor
-                    .buffer
-                    .replace_range(self.editor.selection.text_range(), text);
-            }
-            self.editor.selection.text_range().start
-        };
+        let range = self
+            .editor
+            .compose
+            .clone()
+            .unwrap_or_else(|| self.editor.selection.text_range());
+        let start = range.start;
+        self.editor.replace_buffer_range(range, text);
         self.editor.compose = Some(start..start + text.len());
         self.editor.show_cursor = cursor.is_some();
         self.update_layout();
@@ -400,7 +406,7 @@ where
     /// and moves the cursor to the start of the former preedit region.
     pub fn clear_compose(&mut self) {
         if let Some(preedit_range) = self.editor.compose.take() {
-            self.editor.buffer.replace_range(preedit_range.clone(), "");
+            self.editor.replace_buffer_range(preedit_range.clone(), "");
             self.editor.show_cursor = true;
             self.update_layout();
 
@@ -953,6 +959,7 @@ where
     pub fn set_text(&mut self, is: &str) {
         self.buffer.clear();
         self.buffer.push_str(is);
+        self.style_spans.clear();
         let clamp = |cursor: Cursor| {
             let mut index = cursor.index.min(is.len());
             while !is.is_char_boundary(index) {
@@ -1030,6 +1037,67 @@ where
     pub fn set_quantize(&mut self, quantize: bool) {
         self.quantize = quantize;
         self.layout_dirty = true;
+    }
+
+    /// Replace all attributed styles, retaining text, selection and composition.
+    ///
+    /// Invalid input is rejected atomically. This does not set any text, and
+    /// offsets refer to `raw_text()`, including any active IME preedit.
+    pub fn set_style_spans(
+        &mut self,
+        spans: Vec<EditorStyleSpan<T>>,
+    ) -> Result<(), InvalidStyleRange> {
+        if spans.iter().any(|span| {
+            span.range.start > span.range.end
+                || !self.buffer.is_char_boundary(span.range.start)
+                || !self.buffer.is_char_boundary(span.range.end)
+        }) {
+            return Err(InvalidStyleRange);
+        }
+        self.style_spans = spans;
+        self.layout_dirty = true;
+        Ok(())
+    }
+
+    /// Attributed styles for the current raw UTF-8 buffer.
+    pub fn style_spans(&self) -> &[EditorStyleSpan<T>] {
+        &self.style_spans
+    }
+
+    // Every text edit, including preedit replacement/cancellation, passes here.
+    // Insertions inherit the properties immediately to their left, except at
+    // the start of the document where the first character's properties apply.
+    // This preserves the number/order of ranges and never creates a span for
+    // deleted-only text. Controlled rich editors may replace these attributes
+    // after applying their own explicit typing-style policy.
+    fn replace_buffer_range(&mut self, range: Range<usize>, text: &str) {
+        let old_len = range.end - range.start;
+        let inserted = text.len();
+        self.style_spans.retain_mut(|span| {
+            let inherit = if range.start == 0 {
+                span.range.start == 0 && span.range.end > 0
+            } else {
+                span.range.start < range.start && span.range.end >= range.start
+            };
+            let shift = |offset: usize| offset - old_len + inserted;
+            let mut start = if span.range.start >= range.end {
+                shift(span.range.start)
+            } else {
+                span.range.start.min(range.start)
+            };
+            let mut end = if span.range.end > range.end {
+                shift(span.range.end)
+            } else {
+                span.range.end.min(range.start)
+            };
+            if inherit && inserted > 0 {
+                start = start.min(range.start);
+                end = end.max(range.start + inserted);
+            }
+            span.range = start..end;
+            start < end
+        });
+        self.buffer.replace_range(range, text);
     }
 
     /// Modify the styles provided for this editor.
@@ -1137,11 +1205,7 @@ where
     ) {
         let range = self.selection.text_range();
         let start = range.start;
-        if self.selection.is_collapsed() {
-            self.buffer.insert_str(start, s);
-        } else {
-            self.buffer.replace_range(range.clone(), s);
-        }
+        self.replace_buffer_range(range.clone(), s);
         self.update_compose_for_replaced_range(range, s.len());
 
         self.update_layout(font_cx, layout_cx);
@@ -1203,6 +1267,9 @@ where
         for prop in self.default_style.inner().values() {
             builder.push_default(prop.to_owned());
         }
+        for span in &self.style_spans {
+            builder.push(span.property.clone(), span.range.clone());
+        }
         if let Some(preedit_range) = &self.compose {
             builder.push(StyleProperty::Underline(true), preedit_range.clone());
         }
@@ -1213,5 +1280,80 @@ where
         self.selection = self.selection.refresh(&self.layout);
         self.layout_dirty = false;
         self.generation.nudge();
+    }
+}
+
+#[cfg(test)]
+mod attributed_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn styled() -> PlainEditor<()> {
+        let mut editor = PlainEditor::new(16.0);
+        editor.set_text("ab😀cd");
+        editor
+            .set_style_spans(vec![EditorStyleSpan {
+                range: 2..6,
+                property: StyleProperty::Underline(true),
+            }])
+            .unwrap();
+        editor
+    }
+
+    #[test]
+    fn invalid_range_preserves_existing_attributes() {
+        let mut editor = styled();
+        let original = editor.style_spans().to_vec();
+        assert_eq!(
+            editor.set_style_spans(vec![EditorStyleSpan {
+                range: 3..6,
+                property: StyleProperty::Underline(false),
+            }]),
+            Err(InvalidStyleRange)
+        );
+        assert_eq!(editor.style_spans(), original);
+    }
+
+    #[test]
+    fn utf8_edits_shift_and_extend_only_the_typing_style() {
+        let mut editor = styled();
+        editor.replace_buffer_range(2..2, "中");
+        assert_eq!(editor.style_spans()[0].range, 5..9);
+        editor.replace_buffer_range(9..9, "文");
+        assert_eq!(editor.style_spans()[0].range, 5..12);
+        editor.replace_buffer_range(5..12, "");
+        assert!(editor.style_spans().is_empty());
+    }
+
+    #[test]
+    fn deletion_crossing_a_span_keeps_only_surviving_attribution() {
+        let mut editor = styled();
+        editor.replace_buffer_range(1..6, "Z");
+        assert!(editor.style_spans().is_empty());
+        assert_eq!(editor.raw_text(), "aZcd");
+    }
+
+    #[test]
+    fn attributes_reach_the_actual_layout_and_keep_selection() {
+        let mut editor = styled();
+        let mut fonts = FontContext::new();
+        let mut layouts = LayoutContext::new();
+        let selection = editor.raw_selection().text_range();
+        editor.update_layout(&mut fonts, &mut layouts);
+        assert_eq!(editor.raw_selection().text_range(), selection);
+        assert!(
+            editor
+                .layout
+                .styles()
+                .iter()
+                .any(|style| style.underline.is_some())
+        );
+    }
+
+    #[test]
+    fn replacing_controlled_text_clears_old_range_lifetimes() {
+        let mut editor = styled();
+        editor.set_text("x");
+        assert!(editor.style_spans().is_empty());
     }
 }
